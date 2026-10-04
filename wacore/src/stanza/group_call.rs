@@ -299,6 +299,17 @@ fn parse_group_snapshot(
     if node.tag != expected_tag {
         return Err(group_stanza_error("unexpected group snapshot envelope"));
     }
+    // An ack that names an error code is the call service refusing the action. The initial group
+    // offer is the only snapshot whose parser does not run through `validate_call_ack`, so without
+    // this a refusal would be misread as a malformed snapshot further down.
+    if matches!(envelope, GroupSnapshotEnvelope::Ack)
+        && let Some(error) = node
+            .get_attr("error")
+            .map(|value| value.as_str().into_owned())
+            .filter(|error| !error.is_empty())
+    {
+        return Err(anyhow!("group offer rejected with error {error}"));
+    }
 
     let group_info = node.get_optional_child("group_info");
     let Some(group_info) = group_info else {
@@ -321,7 +332,7 @@ fn parse_group_snapshot(
         finish_attrs(&attrs)?;
     }
 
-    let mut update = parse_group_info(group_info, call_id, call_creator)?;
+    let mut update = parse_group_info(group_info, envelope, call_id, call_creator)?;
     match envelope {
         GroupSnapshotEnvelope::Offer => {
             if let Some(group_jid) = attrs.optional_jid("group-jid") {
@@ -374,14 +385,29 @@ fn parse_group_snapshot(
 #[inline(never)]
 fn parse_group_info(
     node: &NodeRef<'_>,
+    envelope: GroupSnapshotEnvelope,
     call_id: String,
     call_creator: Jid,
 ) -> Result<GroupCallUpdate> {
     let mut attrs = node.attrs();
     let group_jid = attrs.optional_jid("group-jid");
     let media = required_string(&mut attrs, "media")?;
-    let transaction_id = required_u32(&mut attrs, "transaction-id")?;
-    let connected_limit = required_u32(&mut attrs, "connected-limit")?;
+    // The initial offer's ack carries the authoritative roster as a partial snapshot: identity,
+    // media and participants. The ordering `transaction-id` and the `connected-limit` are
+    // update-plane state and arrive on the first `group_update`, so an ack that omits them is not
+    // malformed and must not be refused. Zero is exactly the state a freshly acked offer is in:
+    // no ordering transaction has been applied yet, and zero already means "no connected limit".
+    // The signed `offer`/`group_update` envelopes still require both.
+    let (transaction_id, connected_limit) = match envelope {
+        GroupSnapshotEnvelope::Ack => (
+            optional_u32(&mut attrs, "transaction-id")?.unwrap_or(0),
+            optional_u32(&mut attrs, "connected-limit")?.unwrap_or(0),
+        ),
+        GroupSnapshotEnvelope::Offer | GroupSnapshotEnvelope::Update => (
+            required_u32(&mut attrs, "transaction-id")?,
+            required_u32(&mut attrs, "connected-limit")?,
+        ),
+    };
     let joinable = attrs.optional_string("joinable").as_deref() == Some("1");
     let rekey_requested = attrs.optional_string("rekey").as_deref() == Some("1");
     let mut participants = Vec::new();
@@ -1706,6 +1732,77 @@ mod tests {
             .expect("valid offer")
             .expect("group snapshot");
         assert!(update.joinable);
+    }
+
+    /// The live call service answers an initial group offer with an ack whose `group_info` is a
+    /// partial snapshot: identity, media and roster, but none of the update-plane integers. Such an
+    /// ack must parse, with the ordering transaction at zero and no connected limit.
+    #[test]
+    fn group_offer_ack_without_update_plane_integers_parses() {
+        let creator = jid("100001", 1);
+        let ack = NodeBuilder::new("ack")
+            .attr("class", "call")
+            .attr("type", "offer")
+            .attr("id", "REQ-1")
+            .children([NodeBuilder::new("group_info")
+                .attr("call-id", "CID")
+                .attr("call-creator", &creator)
+                .attr("media", "audio")
+                .children([NodeBuilder::new("user")
+                    .attr("jid", &creator)
+                    .children([NodeBuilder::new("device")
+                        .attr("jid", jid("100001", 1))
+                        .build()])
+                    .build()])
+                .build()])
+            .build();
+
+        let update = parse_initial_group_call_ack(&ack.as_node_ref())
+            .expect("a partial ack snapshot parses")
+            .expect("group snapshot");
+        assert_eq!(update.call_id, "CID");
+        assert_eq!(update.call_creator, creator);
+        assert_eq!(update.media, "audio");
+        assert_eq!(update.transaction_id, 0);
+        assert_eq!(update.connected_limit, 0);
+        assert_eq!(update.participants.len(), 1);
+    }
+
+    /// An ack that names an error code is the call service refusing the offer, and must be reported
+    /// as a refusal rather than parsed into a snapshot.
+    #[test]
+    fn group_offer_ack_naming_an_error_is_a_refusal() {
+        let creator = jid("100001", 1);
+        let ack = NodeBuilder::new("ack")
+            .attr("class", "call")
+            .attr("type", "offer")
+            .attr("error", "439")
+            .children([NodeBuilder::new("group_info")
+                .attr("call-id", "CID")
+                .attr("call-creator", &creator)
+                .attr("media", "audio")
+                .build()])
+            .build();
+        let error = parse_initial_group_call_ack(&ack.as_node_ref())
+            .expect_err("a refusal is not a snapshot");
+        assert!(
+            error.to_string().contains("rejected with error 439"),
+            "unexpected parse error: {error:#}"
+        );
+    }
+
+    /// A `group_update` still requires both update-plane integers; only the ack relaxes them.
+    #[test]
+    fn group_update_still_requires_update_plane_integers() {
+        let creator = jid("100001", 1);
+        let node = NodeBuilder::new("group_update")
+            .attr("call-id", "CID")
+            .attr("call-creator", &creator)
+            .children([NodeBuilder::new("group_info")
+                .attr("media", "audio")
+                .build()])
+            .build();
+        assert!(parse_group_update(&node.as_node_ref()).is_err());
     }
 
     #[test]
