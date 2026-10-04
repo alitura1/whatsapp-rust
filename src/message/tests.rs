@@ -15787,6 +15787,14 @@ mod pdo_alias_tests {
             expected,
             "legacy fast-ratchet equivalence is unproven"
         );
+        let mut inner_without_skdm = carrier.clone();
+        inner_without_skdm.sender_key_distribution_message.take();
+        let nested_without_skdm = wa::Message {
+            ephemeral_message: buffa::MessageField::some(wa::message::FutureProofMessage {
+                message: buffa::MessageField::some(inner_without_skdm),
+            }),
+            ..Default::default()
+        };
         let nested = wa::Message {
             ephemeral_message: buffa::MessageField::some(wa::message::FutureProofMessage {
                 message: buffa::MessageField::some(carrier),
@@ -15795,8 +15803,8 @@ mod pdo_alias_tests {
         };
         assert_ne!(
             MessageDispatch::fingerprint(&nested),
-            expected,
-            "never recurse through wrappers to discard fields"
+            MessageDispatch::fingerprint(&nested_without_skdm),
+            "otherwise identical wrappers must retain the inner SKDM difference"
         );
 
         // Unknown fields and a field-2 value with the wrong wire type remain
@@ -16950,8 +16958,10 @@ async fn pdo_retry_skdm_equivalence_preserves_distinct_user_payloads() {
         }
     }
 
-    for case in 0..14 {
-        let with_hook = case >= 7;
+    for case in 0..56 {
+        let with_hook = case % 14 >= 7;
+        let offline = case % 28 >= 14;
+        let with_pdo = case < 28;
         let variant = case % 7;
         for order in [[0, 1, 2], [1, 0, 2], [1, 2, 0]] {
             let (client, transport) = capturing_client("issue1634_counterfactual").await;
@@ -17020,12 +17030,32 @@ async fn pdo_retry_skdm_equivalence_preserves_distinct_user_payloads() {
                 r1.sender_key_distribution_message = buffa::MessageField::some(skdm);
             }
             let mut r2 = r1.clone();
+            let mut rotated_chain_id = None;
             match variant {
                 1 => {
-                    // The sender has already advanced past the failed skmsg.
-                    // A second retry can distribute the newer iteration; its
-                    // key processing must run even when its event is suppressed.
-                    let newer = sender.create_group_skdm(&group).await;
+                    // Same-ID distributions deliberately do not reset a known
+                    // chain. Rotate to a new valid chain instead: its followup
+                    // can only decrypt if the suppressed retry2 processed it.
+                    let name =
+                        make_sender_key_name(&group, &sender.jid.to_non_ad().to_protocol_address());
+                    let old = sender.sender_keys.0.remove(&name).unwrap();
+                    let old_id = old.sender_key_state().unwrap().chain_id();
+                    let newer = loop {
+                        let distribution = sender.create_group_skdm(&group).await;
+                        let new_id = sender
+                            .sender_keys
+                            .0
+                            .get(&name)
+                            .unwrap()
+                            .sender_key_state()
+                            .unwrap()
+                            .chain_id();
+                        if new_id != old_id {
+                            rotated_chain_id = Some(new_id);
+                            break distribution;
+                        }
+                        sender.sender_keys.0.remove(&name);
+                    };
                     assert_ne!(
                         r1.sender_key_distribution_message
                             .as_option()
@@ -17169,13 +17199,35 @@ async fn pdo_retry_skdm_equivalence_preserves_distinct_user_payloads() {
             };
             let pdo =
                 PdoRetryFixture::encode_phone_response(&mut phone, &receiver, &response).await;
+            if offline {
+                client.inbound_commit_batch.reset();
+            }
             for leg in order {
+                if leg == 0 && !with_pdo {
+                    continue;
+                }
                 let node = if leg == 0 {
                     pdo.clone()
                 } else {
                     retries[leg - 1].clone()
                 };
                 client.clone().handle_incoming_message(node).await;
+            }
+            if let Some(expected_chain_id) = rotated_chain_id {
+                let snapshot = client.persistence_manager.get_device_snapshot();
+                let name =
+                    make_sender_key_name(&group, &sender.jid.to_non_ad().to_protocol_address());
+                let record = client
+                    .signal_cache
+                    .get_sender_key(&name, &*snapshot.backend)
+                    .await
+                    .unwrap()
+                    .expect("rotated retry SKDM installed");
+                assert_eq!(
+                    record.sender_key_state().unwrap().chain_id(),
+                    expected_chain_id,
+                    "retry2 must apply its rotated distribution before event suppression"
+                );
             }
             if variant != 0 {
                 // Even a suppressed retry must install its SKDM: a subsequent
@@ -17198,6 +17250,13 @@ async fn pdo_retry_skdm_equivalence_preserves_distinct_user_payloads() {
                         followup,
                     ))
                     .await;
+            }
+            if offline {
+                assert!(
+                    client
+                        .flush_inbound_commits_under_permit(true, None, None)
+                        .await
+                );
             }
             crate::test_utils::wait_for_outbound_tasks(&client).await;
             let mut delivered = Vec::new();
@@ -17291,7 +17350,7 @@ async fn pdo_retry_skdm_equivalence_preserves_distinct_user_payloads() {
                 _ => {}
             }
             println!(
-                "synthetic counterfactual: variant={variant}, with_hook={with_hook}, order={order:?}, decrypted={decrypted}, events={}",
+                "synthetic counterfactual: variant={variant}, with_hook={with_hook}, offline={offline}, with_pdo={with_pdo}, order={order:?}, decrypted={decrypted}, events={}",
                 delivered.len()
             );
         }
