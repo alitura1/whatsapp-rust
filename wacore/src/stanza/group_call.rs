@@ -39,7 +39,13 @@ pub struct InitialGroupOfferParams<'a> {
     pub call_creator: &'a Jid,
     pub group_jid: Option<&'a Jid>,
     pub participants: &'a [GroupCallParticipant],
-    pub audio_rate: u32,
+    /// The audio sample rates the offer advertises, in preference order.
+    ///
+    /// The captured initial group offer advertises the standard pair, 8000 then 16000
+    /// (`voip/initial_group_call`, capture
+    /// `1851cf76118bc8ef116df4ea51db73968cef3d415996cdf34013bdee9ac27fc7`), so a caller passing a
+    /// single rate does not reproduce the offer WhatsApp accepts.
+    pub audio_rates: &'a [&'a str],
     pub video: bool,
 }
 
@@ -124,13 +130,18 @@ pub fn build_initial_group_offer(params: &InitialGroupOfferParams<'_>) -> Result
             params.participants.len()
         );
     }
-    if params.audio_rate == 0 {
-        bail!("group offer audio rate must be non-zero");
+    if params.audio_rates.is_empty() {
+        bail!("group offer must advertise at least one audio rate");
     }
 
     let users = build_group_users(params.participants, Some(params.call_creator), params.video)?;
-    let audio_rate = params.audio_rate.to_string();
-    let mut children = vec![audio_opus(&audio_rate)];
+    // The captured offer advertises the full rate pair, and the call service resolves the codec
+    // from it: emitting one rate is the deviation that the initial-offer ack refuses.
+    let mut children: Vec<Node> = params
+        .audio_rates
+        .iter()
+        .map(|rate| audio_opus(rate))
+        .collect();
     if params.video {
         // No handle exists for a call still being offered, so no rotation can
         // have been set for it yet.
@@ -1377,7 +1388,7 @@ mod tests {
             call_creator: &creator,
             group_jid: Some(&group),
             participants: &participants,
-            audio_rate: 16_000,
+            audio_rates: &["8000", "16000"],
             video: true,
         })
         .expect("valid offer");
@@ -1388,13 +1399,17 @@ mod tests {
         );
         assert_eq!(
             child_tags(action(&node)),
-            ["audio", "video", "net", "group_info"]
+            ["audio", "audio", "video", "net", "group_info"]
         );
         let action = action(&node);
         let action_ref = action.as_node_ref();
         let action_children = action_ref.children().expect("group offer children");
-        let audio = &action_children[0];
-        assert_eq!(audio.attrs().optional_u64("rate"), Some(16_000));
+        // The captured offer advertises the standard rate pair, in order, before the media mode.
+        assert_eq!(action_children[0].attrs().optional_u64("rate"), Some(8_000));
+        assert_eq!(
+            action_children[1].attrs().optional_u64("rate"),
+            Some(16_000)
+        );
         assert_eq!(
             action
                 .attrs
@@ -1441,6 +1456,62 @@ mod tests {
         );
     }
 
+    /// The captured initial group offer (`voip/initial_group_call`) carries the standard audio
+    /// rate pair, a device-suffixed creator device, the capability blob on the local device only,
+    /// and a bare plus device-suffixed device for every remote — the ack refuses an offer that
+    /// deviates, so this pins the shape to the capture.
+    #[test]
+    fn initial_group_offer_matches_the_captured_shape() {
+        let creator = jid("100001", 14);
+        let participants = [
+            participant("100001", 14, &CAPABILITY_OFFER),
+            participant("200002", 1, &[]),
+            participant("300003", 44, &[]),
+        ];
+        let node = build_initial_group_offer(&InitialGroupOfferParams {
+            call_id: "00aabbccddeeff001122334455667788",
+            id: "REQ-1",
+            call_creator: &creator,
+            group_jid: None,
+            participants: &participants,
+            audio_rates: &["8000", "16000"],
+            video: false,
+        })
+        .expect("valid offer");
+        let action = action(&node);
+        assert_eq!(
+            child_tags(action),
+            ["audio", "audio", "net", "group_info"],
+            "the captured offer advertises both rates before the network descriptor"
+        );
+        let action_ref = action.as_node_ref();
+        let audio: Vec<Option<u64>> = action_ref
+            .children()
+            .expect("offer children")
+            .iter()
+            .filter(|child| child.tag == "audio")
+            .map(|child| child.attrs().optional_u64("rate"))
+            .collect();
+        assert_eq!(audio, [Some(8_000), Some(16_000)]);
+        let users = action_ref
+            .get_optional_child("group_info")
+            .expect("group_info")
+            .children()
+            .expect("users");
+        assert_eq!(users.len(), 3);
+        // Only the local device advertises a capability.
+        let self_device = &users[0].children().expect("self devices")[0];
+        assert!(self_device.get_optional_child("capability").is_some());
+        assert!(
+            users[1..].iter().all(|user| user
+                .children()
+                .expect("remote devices")
+                .iter()
+                .all(|device| device.get_optional_child("capability").is_none())),
+            "a remote device must not carry the local capability blob"
+        );
+    }
+
     #[test]
     fn initial_group_offer_rejects_mismatched_group_jid() {
         let creator = jid("100001", 1);
@@ -1456,7 +1527,7 @@ mod tests {
             call_creator: &creator,
             group_jid: Some(&group),
             participants: &participants,
-            audio_rate: 16_000,
+            audio_rates: &["8000", "16000"],
             video: false,
         })
         .expect("valid offer");
@@ -1503,7 +1574,7 @@ mod tests {
             call_creator: &creator,
             group_jid: None,
             participants: &participants,
-            audio_rate: 16_000,
+            audio_rates: &["8000", "16000"],
             video: true,
         })
         .expect("valid offer");
@@ -1537,7 +1608,7 @@ mod tests {
                 call_creator: &creator,
                 group_jid: None,
                 participants: &too_small,
-                audio_rate: 16_000,
+                audio_rates: &["8000", "16000"],
                 video: false,
             })
             .is_err()
@@ -1554,7 +1625,7 @@ mod tests {
                 call_creator: &creator,
                 group_jid: Some(&Jid::new("not-a-group", Server::Lid)),
                 participants: &enough,
-                audio_rate: 16_000,
+                audio_rates: &["8000", "16000"],
                 video: false,
             })
             .is_err()

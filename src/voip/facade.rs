@@ -18,9 +18,9 @@ use wacore::messages::MessageUtils;
 use wacore::stanza::call::{
     AcceptParams, CAPABILITY_OFFER, CAPABILITY_PREACCEPT, CAPABILITY_STANDARD_OPUS_OFFER,
     CAPABILITY_STANDARD_OPUS_PREACCEPT, CAPABILITY_STANDARD_OPUS_VIDEO_OFFER,
-    CAPABILITY_VIDEO_OFFER, OfferDeviceKey, OfferParams, TerminateParams, VideoStateParams,
-    build_accept, build_offer, build_preaccept_with_capability, build_terminate, build_video_state,
-    standard_opus_voip_settings,
+    CAPABILITY_VIDEO_OFFER, DEFAULT_AUDIO_RATES, OfferDeviceKey, OfferParams, TerminateParams,
+    VideoStateParams, build_accept, build_offer, build_preaccept_with_capability, build_terminate,
+    build_video_state, standard_opus_voip_settings,
 };
 use wacore::stanza::group_call::{
     GroupInviteOfferParams, InitialGroupOfferParams, build_group_invite_offer,
@@ -864,7 +864,9 @@ impl<'a> OutgoingGroupCall<'a> {
             call_creator: &own_lid,
             group_jid: self.group_jid.as_ref(),
             participants: &participants,
-            audio_rate: audio.config().format.signaling_rate,
+            // The call service resolves the group codec from the advertised rate pair; the
+            // captured initial group offer carries 8000 and 16000, not the local format's rate.
+            audio_rates: DEFAULT_AUDIO_RATES,
             video: video.is_some(),
         })
         .map_err(|error| CallError::Response(error.to_string()))?;
