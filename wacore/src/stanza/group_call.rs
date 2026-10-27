@@ -303,6 +303,17 @@ fn parse_group_snapshot(
     if node.tag != expected_tag {
         return Err(group_stanza_error("unexpected group snapshot envelope"));
     }
+    // An ack that names an error code is the call service refusing the action. The initial group
+    // offer is the only snapshot whose parser does not run through `validate_call_ack`, so without
+    // this a refusal would be misread as a malformed snapshot further down.
+    if matches!(envelope, GroupSnapshotEnvelope::Ack)
+        && let Some(error) = node
+            .get_attr("error")
+            .map(|value| value.as_str().into_owned())
+            .filter(|error| !error.is_empty())
+    {
+        return Err(anyhow!("group offer rejected with error {error}"));
+    }
 
     let group_info = node.get_optional_child("group_info");
     let Some(group_info) = group_info else {
@@ -325,7 +336,7 @@ fn parse_group_snapshot(
         finish_attrs(&attrs)?;
     }
 
-    let mut update = parse_group_info(group_info, call_id, call_creator)?;
+    let mut update = parse_group_info(group_info, envelope, call_id, call_creator)?;
     match envelope {
         GroupSnapshotEnvelope::Offer => {
             if let Some(group_jid) = attrs.optional_jid("group-jid") {
@@ -378,14 +389,29 @@ fn parse_group_snapshot(
 #[inline(never)]
 fn parse_group_info(
     node: &NodeRef<'_>,
+    envelope: GroupSnapshotEnvelope,
     call_id: String,
     call_creator: Jid,
 ) -> Result<GroupCallUpdate> {
     let mut attrs = node.attrs();
     let group_jid = attrs.optional_jid("group-jid");
     let media = required_string(&mut attrs, "media")?;
-    let transaction_id = required_u32(&mut attrs, "transaction-id")?;
-    let connected_limit = required_u32(&mut attrs, "connected-limit")?;
+    // The initial offer's ack carries the authoritative roster as a partial snapshot: identity,
+    // media and participants. The ordering `transaction-id` and the `connected-limit` are
+    // update-plane state and arrive on the first `group_update`, so an ack that omits them is not
+    // malformed and must not be refused. Zero is exactly the state a freshly acked offer is in:
+    // no ordering transaction has been applied yet, and zero already means "no connected limit".
+    // The signed `offer`/`group_update` envelopes still require both.
+    let (transaction_id, connected_limit) = match envelope {
+        GroupSnapshotEnvelope::Ack => (
+            optional_u32(&mut attrs, "transaction-id")?.unwrap_or(0),
+            optional_u32(&mut attrs, "connected-limit")?.unwrap_or(0),
+        ),
+        GroupSnapshotEnvelope::Offer | GroupSnapshotEnvelope::Update => (
+            required_u32(&mut attrs, "transaction-id")?,
+            required_u32(&mut attrs, "connected-limit")?,
+        ),
+    };
     let joinable = attrs.optional_string("joinable").as_deref() == Some("1");
     let rekey_requested = attrs.optional_string("rekey").as_deref() == Some("1");
     let mut participants = Vec::new();
@@ -1761,6 +1787,172 @@ mod tests {
             .expect("valid offer")
             .expect("group snapshot");
         assert!(update.joinable);
+    }
+
+    /// The live call service answers an initial group offer with an ack whose `group_info` is a
+    /// partial snapshot: identity, media and roster, but none of the update-plane integers. Those
+    /// arrive on the first `group_update`, so such an ack must parse rather than be refused as a
+    /// missing integer, with the ordering transaction at zero and no connected limit.
+    #[test]
+    fn group_offer_ack_without_update_plane_integers_parses() {
+        let creator = jid("100001", 1);
+        let ack = NodeBuilder::new("ack")
+            .attr("class", "call")
+            .attr("type", "offer")
+            .attr("id", "REQ-1")
+            .children([NodeBuilder::new("group_info")
+                .attr("call-id", "CID")
+                .attr("call-creator", &creator)
+                .attr("media", "audio")
+                .children([NodeBuilder::new("user")
+                    .attr("jid", &creator)
+                    .children([NodeBuilder::new("device")
+                        .attr("jid", jid("100001", 1))
+                        .build()])
+                    .build()])
+                .build()])
+            .build();
+
+        let update = parse_initial_group_call_ack(&ack.as_node_ref())
+            .expect("a partial ack snapshot parses")
+            .expect("group snapshot");
+        assert_eq!(update.call_id, "CID");
+        assert_eq!(update.call_creator, creator);
+        assert_eq!(update.media, "audio");
+        assert_eq!(update.transaction_id, 0);
+        assert_eq!(update.connected_limit, 0);
+        assert_eq!(update.participants.len(), 1);
+    }
+
+    /// An ack that does carry the update-plane integers keeps them: the ack envelope tolerates
+    /// their absence, it does not discard what the service actually sent.
+    #[test]
+    fn group_offer_ack_keeps_update_plane_integers_when_present() {
+        let creator = jid("100001", 1);
+        let ack = NodeBuilder::new("ack")
+            .attr("class", "call")
+            .attr("type", "offer")
+            .children([NodeBuilder::new("group_info")
+                .attr("call-id", "CID")
+                .attr("call-creator", &creator)
+                .attr("media", "audio")
+                .attr("transaction-id", "13")
+                .attr("connected-limit", "32")
+                .build()])
+            .build();
+
+        let update = parse_initial_group_call_ack(&ack.as_node_ref())
+            .expect("an ack carrying the update-plane integers parses")
+            .expect("group snapshot");
+        assert_eq!(update.transaction_id, 13);
+        assert_eq!(update.connected_limit, 32);
+    }
+
+    /// The service refuses a group offer it will not serve by naming an error code on the ack
+    /// instead of returning a snapshot; 427 is the code it returns where group calling from a
+    /// linked device is not enabled for the account. The refusal must be reported as one, not read
+    /// as a malformed snapshot or a missing integer.
+    #[test]
+    fn group_offer_ack_naming_error_427_is_a_refusal() {
+        let creator = jid("100001", 1);
+        let ack = NodeBuilder::new("ack")
+            .attr("class", "call")
+            .attr("type", "offer")
+            .attr("error", "427")
+            .children([NodeBuilder::new("group_info")
+                .attr("call-id", "CID")
+                .attr("call-creator", &creator)
+                .attr("media", "audio")
+                .build()])
+            .build();
+        let error = parse_initial_group_call_ack(&ack.as_node_ref())
+            .expect_err("a refusal is not a snapshot");
+        assert!(
+            error.to_string().contains("rejected with error 427"),
+            "unexpected parse error: {error:#}"
+        );
+    }
+
+    /// Only the ack relaxes the two update-plane integers. An empty `error` attribute is not a
+    /// refusal either, so a partial ack that the service left an empty code on still parses.
+    #[test]
+    fn group_offer_ack_treats_an_empty_error_as_no_refusal() {
+        let creator = jid("100001", 1);
+        let ack = NodeBuilder::new("ack")
+            .attr("class", "call")
+            .attr("type", "offer")
+            .attr("error", "")
+            .children([NodeBuilder::new("group_info")
+                .attr("call-id", "CID")
+                .attr("call-creator", &creator)
+                .attr("media", "audio")
+                .build()])
+            .build();
+        let update = parse_initial_group_call_ack(&ack.as_node_ref())
+            .expect("an empty error code is not a refusal")
+            .expect("group snapshot");
+        assert_eq!(update.transaction_id, 0);
+    }
+
+    /// The signed `offer` snapshot and the `group_update` envelope still require both update-plane
+    /// integers: the relaxation is scoped to the ack, not applied to the protocol at large.
+    #[test]
+    fn only_the_ack_relaxes_the_update_plane_integers() {
+        let creator = jid("100001", 1);
+        let offer = NodeBuilder::new(CallActionTag::Offer.as_str())
+            .attr("call-id", "CID")
+            .attr("call-creator", &creator)
+            .children([NodeBuilder::new("group_info")
+                .attr("media", "audio")
+                .build()])
+            .build();
+        assert!(
+            parse_group_invite_snapshot(&offer.as_node_ref()).is_err(),
+            "an offer snapshot without the update-plane integers is still malformed"
+        );
+    }
+
+    /// An ack whose present integer is not a number, and an ack-shaped node sent to the strict
+    /// `group_update` parser, are both refused rather than parsed into a snapshot.
+    #[test]
+    fn group_offer_ack_rejects_malformed_integers_and_a_wrong_envelope() {
+        let creator = jid("100001", 1);
+        let malformed = NodeBuilder::new("ack")
+            .attr("class", "call")
+            .attr("type", "offer")
+            .children([NodeBuilder::new("group_info")
+                .attr("call-id", "CID")
+                .attr("call-creator", &creator)
+                .attr("media", "audio")
+                .attr("transaction-id", "not-a-number")
+                .build()])
+            .build();
+        assert!(parse_initial_group_call_ack(&malformed.as_node_ref()).is_err());
+
+        let no_media = NodeBuilder::new("ack")
+            .attr("class", "call")
+            .attr("type", "offer")
+            .children([NodeBuilder::new("group_info")
+                .attr("call-id", "CID")
+                .attr("call-creator", &creator)
+                .build()])
+            .build();
+        assert!(parse_initial_group_call_ack(&no_media.as_node_ref()).is_err());
+
+        let update = NodeBuilder::new(CallActionTag::GroupUpdate.as_str())
+            .attr("call-id", "CID")
+            .attr("call-creator", &creator)
+            .children([NodeBuilder::new("group_info")
+                .attr("call-id", "CID")
+                .attr("call-creator", &creator)
+                .attr("media", "audio")
+                .build()])
+            .build();
+        assert!(
+            parse_initial_group_call_ack(&update.as_node_ref()).is_err(),
+            "a group_update is not an ack envelope"
+        );
+        assert!(parse_group_update(&update.as_node_ref()).is_err());
     }
 
     #[test]
