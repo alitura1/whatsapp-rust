@@ -4624,6 +4624,7 @@ mod encoded_tests {
                     pn: None,
                     state: Some("connected".to_string()),
                     participant_type: None,
+                    error: None,
                     devices: vec![GroupCallDevice {
                         jid: creator,
                         platform: None,
@@ -4637,6 +4638,7 @@ mod encoded_tests {
                     pn: None,
                     state: Some("connected".to_string()),
                     participant_type: None,
+                    error: None,
                     devices: vec![GroupCallDevice {
                         jid: peer,
                         platform: None,
@@ -5262,6 +5264,7 @@ mod encoded_tests {
             pn: None,
             state: Some("connected".to_string()),
             participant_type: None,
+            error: None,
             devices: vec![GroupCallDevice {
                 jid: participant,
                 platform: None,
@@ -5332,6 +5335,7 @@ mod encoded_tests {
             pn: None,
             state: Some("connected".to_string()),
             participant_type: None,
+            error: None,
             devices: vec![GroupCallDevice {
                 jid: participant,
                 platform: None,
@@ -5416,6 +5420,7 @@ mod encoded_tests {
             pn: None,
             state: Some("connected".to_string()),
             participant_type: None,
+            error: None,
             devices: vec![GroupCallDevice {
                 jid: participant,
                 platform: None,
@@ -5928,6 +5933,7 @@ mod encoded_tests {
             pn: None,
             state: Some("connected".to_string()),
             participant_type: None,
+            error: None,
             devices: vec![GroupCallDevice {
                 jid: participant,
                 platform: None,
@@ -6286,6 +6292,7 @@ mod encoded_tests {
             pn: None,
             state: Some("connected".to_string()),
             participant_type: None,
+            error: None,
             devices: vec![GroupCallDevice {
                 jid: peer,
                 platform: None,
@@ -6335,6 +6342,7 @@ mod encoded_tests {
             pn: None,
             state: Some("connected".to_string()),
             participant_type: None,
+            error: None,
             devices: vec![GroupCallDevice {
                 jid: next_peer,
                 platform: None,
@@ -7062,6 +7070,7 @@ mod tests {
                     pn: None,
                     state: Some("connected".to_string()),
                     participant_type: None,
+                    error: None,
                     devices: vec![GroupCallDevice {
                         jid: self_device,
                         platform: None,
@@ -7075,6 +7084,7 @@ mod tests {
                     pn: None,
                     state: Some("connected".to_string()),
                     participant_type: None,
+                    error: None,
                     devices: vec![GroupCallDevice {
                         jid: peer_device,
                         platform: None,

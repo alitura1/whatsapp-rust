@@ -811,6 +811,7 @@ mod tests {
             pn: None,
             state: Some("connected".to_string()),
             participant_type: None,
+            error: None,
             devices: vec![GroupCallDevice {
                 jid: Jid::new(user, Server::Lid).with_device(device),
                 platform: None,

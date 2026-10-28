@@ -103,6 +103,11 @@ pub struct GroupCallParticipant {
     pub state: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub participant_type: Option<String>,
+    /// The service's NACK code for this entry (`<user error="...">`), reported per participant.
+    /// It is a different fact from the ack's own status: a `207` ack serves the call while
+    /// individual participants fail, so the two are kept apart rather than conflated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<u32>,
     pub devices: Vec<GroupCallDevice>,
 }
 
@@ -113,6 +118,7 @@ impl GroupCallParticipant {
             pn: None,
             state: None,
             participant_type: None,
+            error: None,
             devices,
         }
     }

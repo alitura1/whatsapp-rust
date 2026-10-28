@@ -66,11 +66,37 @@ impl GroupCallState {
     }
 
     /// Advance the authoritative roster and relay allocation on their independent transactions.
-    pub fn apply_update(&mut self, mut update: GroupCallUpdate) -> GroupStateApply {
+    pub fn apply_update(&mut self, update: GroupCallUpdate) -> GroupStateApply {
+        self.apply_snapshot(update, SnapshotAdmission::Strict)
+    }
+
+    /// Admit the snapshot an initial `offer` ack carries, which names the roster the call service
+    /// accepted and not yet the two update-plane integers: no roster transaction has been applied
+    /// while that ack is in flight, and the ack declares no connected limit. Absent them, an ack
+    /// that omits either is the state the call is actually in, not a malformed roster.
+    ///
+    /// Bounded to the first snapshot a call admits: every `group_update` and every later roster
+    /// still states both, so the relaxation cannot carry past the ack it exists for.
+    pub fn apply_initial_offer_ack(&mut self, update: GroupCallUpdate) -> GroupStateApply {
+        self.apply_snapshot(update, SnapshotAdmission::InitialOfferAck)
+    }
+
+    fn apply_snapshot(
+        &mut self,
+        mut update: GroupCallUpdate,
+        admission: SnapshotAdmission,
+    ) -> GroupStateApply {
+        // Only a state that holds no snapshot yet can be admitting the ack's partial one.
+        let admission = match admission {
+            SnapshotAdmission::InitialOfferAck if self.snapshot.is_none() => {
+                SnapshotAdmission::InitialOfferAck
+            }
+            _ => SnapshotAdmission::Strict,
+        };
         if !self.matches_identity(&update.call_id, &update.call_creator) {
             return GroupStateApply::IdentityMismatch;
         }
-        if !valid_group_snapshot(&update) {
+        if !valid_group_snapshot(&update, admission) {
             return GroupStateApply::InvalidSnapshot;
         }
         if let Some(current_group_jid) = self
@@ -154,7 +180,7 @@ impl GroupCallState {
                 .as_ref()
                 .and_then(|snapshot| snapshot.relay.clone());
         }
-        if !valid_group_snapshot(&update) {
+        if !valid_group_snapshot(&update, admission) {
             return GroupStateApply::InvalidSnapshot;
         }
         // Only the fully validated candidate may consume a transaction or alter participant controls.
@@ -295,7 +321,20 @@ impl crate::stats::HeapSize for GroupCallState {
     }
 }
 
-fn valid_group_snapshot(update: &GroupCallUpdate) -> bool {
+/// Which snapshot a call is being asked to admit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotAdmission {
+    /// A roster the call service has already ordered: both update-plane integers are stated.
+    Strict,
+    /// The first snapshot of an outgoing group call's `offer` ack, which does not state them yet.
+    InitialOfferAck,
+}
+
+fn valid_group_snapshot(update: &GroupCallUpdate, admission: SnapshotAdmission) -> bool {
+    // The ack's partial snapshot leaves the ordering transaction unallocated and declares no
+    // connected limit, which `0` is how it says so; a strict roster that writes `0` there is
+    // malformed rather than absent, and a declared limit still cannot be exceeded by its roster.
+    let partial = admission == SnapshotAdmission::InitialOfferAck;
     let connected = update
         .participants
         .iter()
@@ -308,12 +347,11 @@ fn valid_group_snapshot(update: &GroupCallUpdate) -> bool {
         .flat_map(|participant| participant.devices.iter())
         .filter(|device| device.pid.is_some())
         .count();
-    if update.transaction_id == 0
-        || update.connected_limit == 0
+    if (!partial && (update.transaction_id == 0 || update.connected_limit == 0))
         || update.connected_limit as usize > GROUP_CALL_MAX_PARTICIPANTS
         || update.participants.len() > GROUP_CALL_MAX_PARTICIPANTS
         || active_devices > GROUP_CALL_MAX_PARTICIPANTS
-        || connected > update.connected_limit as usize
+        || (update.connected_limit != 0 && connected > update.connected_limit as usize)
         || !matches!(update.media.as_str(), "audio" | "video")
     {
         return false;
@@ -474,6 +512,7 @@ mod tests {
             pn: None,
             state: Some(state.to_string()),
             participant_type: None,
+            error: None,
             devices: vec![GroupCallDevice {
                 jid: Jid::new(user, Server::Lid).with_device(1),
                 platform: Some("web".to_string()),
@@ -1083,6 +1122,148 @@ mod tests {
             state.apply_update(update(1, vec![device_fanout])),
             GroupStateApply::InvalidSnapshot,
             "one connected user cannot expand the active media registry past the call limit"
+        );
+    }
+
+    /// The snapshot an initial `offer` ack carries names the roster the call service accepted
+    /// before any roster transaction exists, and declares no connected limit. It is admitted as
+    /// the first snapshot of the call it answers, where a roster the service has already ordered
+    /// and wrote the same zeros on stays malformed.
+    #[test]
+    fn a_partial_offer_ack_is_admitted_as_the_first_snapshot() {
+        let partial = |transaction_id: u32, limit: u32| {
+            let mut update = update(transaction_id, vec![participant("100001", "connected", 1)]);
+            update.connected_limit = limit;
+            update
+        };
+        let mut state = GroupCallState::new("CALL", creator());
+        assert_eq!(
+            state.apply_update(partial(0, 0)),
+            GroupStateApply::InvalidSnapshot,
+            "an ordered roster must state both update-plane integers"
+        );
+        assert!(state.snapshot().is_none());
+
+        assert_eq!(
+            state.apply_initial_offer_ack(partial(0, 0)),
+            GroupStateApply::Applied
+        );
+        assert_eq!(
+            state
+                .snapshot()
+                .map(|snapshot| (snapshot.transaction_id, snapshot.connected_limit)),
+            Some((0, 0)),
+            "the ack's roster is held as the call's snapshot, with no update-plane state claimed"
+        );
+        assert_eq!(
+            state.snapshot().map(|snapshot| snapshot.participants.len()),
+            Some(1),
+            "the ack's roster is committed, not a placeholder"
+        );
+
+        // The first roster the service orders still advances the call past the partial snapshot.
+        assert_eq!(
+            state.apply_update(update(1, vec![participant("100001", "connected", 1)])),
+            GroupStateApply::Applied
+        );
+        assert_eq!(
+            state.snapshot().map(|snapshot| snapshot.transaction_id),
+            Some(1)
+        );
+    }
+
+    /// The ack's relaxation is bounded to the one snapshot it is: once a call holds a roster, a
+    /// partial one is malformed again, whatever envelope it arrives under.
+    #[test]
+    fn only_the_first_snapshot_may_be_the_partial_offer_ack() {
+        let mut state = GroupCallState::new("CALL", creator());
+        assert_eq!(
+            state.apply_initial_offer_ack(update(5, vec![])),
+            GroupStateApply::Applied
+        );
+
+        let mut partial = update(6, vec![participant("100001", "connected", 1)]);
+        partial.connected_limit = 0;
+        assert_eq!(
+            state.apply_initial_offer_ack(partial.clone()),
+            GroupStateApply::InvalidSnapshot,
+            "a later roster cannot borrow the ack's missing integers"
+        );
+        assert_eq!(
+            state.apply_update(partial),
+            GroupStateApply::InvalidSnapshot,
+            "nor can it through the ordinary path"
+        );
+        assert_eq!(
+            state.snapshot().map(|snapshot| snapshot.transaction_id),
+            Some(5),
+            "the refused snapshots consumed no transaction"
+        );
+    }
+
+    /// The ack is excused the two integers and nothing else: a failed declared limit, an unknown
+    /// media mode, and a foreign identity are all still refusals, and none of them commits.
+    #[test]
+    fn a_partial_offer_ack_still_answers_to_every_other_roster_rule() {
+        let mut state = GroupCallState::new("CALL", creator());
+
+        let mut unknown_media = update(0, vec![]);
+        unknown_media.connected_limit = 0;
+        unknown_media.media = "text".to_string();
+        assert_eq!(
+            state.apply_initial_offer_ack(unknown_media),
+            GroupStateApply::InvalidSnapshot
+        );
+
+        let mut over_limit = update(
+            0,
+            vec![
+                participant("100001", "connected", 1),
+                participant("200002", "connected", 2),
+            ],
+        );
+        over_limit.connected_limit = 1;
+        assert_eq!(
+            state.apply_initial_offer_ack(over_limit),
+            GroupStateApply::InvalidSnapshot,
+            "a limit the ack does declare still bounds the roster it names"
+        );
+
+        let mut oversized = update(0, vec![]);
+        oversized.connected_limit = GROUP_CALL_MAX_PARTICIPANTS as u32 + 1;
+        assert_eq!(
+            state.apply_initial_offer_ack(oversized),
+            GroupStateApply::InvalidSnapshot
+        );
+
+        let mut foreign = update(0, vec![]);
+        foreign.connected_limit = 0;
+        foreign.call_creator = Jid::new("999999", Server::Lid);
+        assert_eq!(
+            state.apply_initial_offer_ack(foreign),
+            GroupStateApply::IdentityMismatch
+        );
+        assert!(state.snapshot().is_none(), "nothing partial was committed");
+    }
+
+    /// A roster entry's own error code is not call state and is never folded into it: it is
+    /// committed with the roster it arrived on, untouched, beside the call's own transaction.
+    #[test]
+    fn a_participant_error_rides_with_the_snapshot_it_arrived_on() {
+        let mut state = GroupCallState::new("CALL", creator());
+        let mut roster = update(1, vec![participant("100001", "connected", 1)]);
+        roster.participants[0].error = Some(487);
+
+        assert_eq!(state.apply_update(roster), GroupStateApply::Applied);
+        let snapshot = state.snapshot().expect("the roster was committed");
+        assert_eq!(
+            snapshot.transaction_id, 1,
+            "the call's own status is the roster's transaction"
+        );
+        assert_eq!(
+            snapshot.participants[0].error,
+            Some(487),
+            "the participant's failure survives admission separately"
         );
     }
 

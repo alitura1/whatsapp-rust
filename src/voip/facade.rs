@@ -1043,8 +1043,11 @@ impl<'a> OutgoingGroupCall<'a> {
             .ok_or(CallError::CallEndedDuringSetup)?;
         let transition_guard = transition_lock.lock().await;
         registration.ensure_current()?;
-        let applied =
-            registry.apply_group_update_if_current(ack_update.clone(), registration.generation);
+        // The ack carries the roster the service accepted and not yet the update-plane integers,
+        // so it is admitted as the initial partial snapshot a call may hold. Waiting for the first
+        // `group_update` instead would stall an accepted call before its relay is set up.
+        let applied = registry
+            .apply_initial_offer_ack_if_current(ack_update.clone(), registration.generation);
         if !matches!(
             applied,
             wacore::voip_control::group::GroupStateApply::Applied
