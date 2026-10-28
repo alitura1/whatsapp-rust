@@ -86,16 +86,26 @@ impl GroupCallState {
         mut update: GroupCallUpdate,
         admission: SnapshotAdmission,
     ) -> GroupStateApply {
-        // Only a state that holds no snapshot yet can be admitting the ack's partial one.
-        let admission = match admission {
-            SnapshotAdmission::InitialOfferAck if self.snapshot.is_none() => {
-                SnapshotAdmission::InitialOfferAck
-            }
-            _ => SnapshotAdmission::Strict,
-        };
         if !self.matches_identity(&update.call_id, &update.call_creator) {
             return GroupStateApply::IdentityMismatch;
         }
+        let admission = match admission {
+            // Only a state that holds no snapshot yet can be admitting the ack's partial one.
+            SnapshotAdmission::InitialOfferAck if self.snapshot.is_none() => {
+                SnapshotAdmission::InitialOfferAck
+            }
+            // A roster has been ordered since this ack was sent, so a partial one is the ack
+            // being overtaken rather than a malformed roster: report it stale — the offer path
+            // already tolerates `Stale` — and leave the committed roster and its relay alone.
+            // An ack that states both integers is an ordered roster and answers to the strict
+            // rules like any other.
+            SnapshotAdmission::InitialOfferAck
+                if update.transaction_id == 0 || update.connected_limit == 0 =>
+            {
+                return GroupStateApply::Stale;
+            }
+            _ => SnapshotAdmission::Strict,
+        };
         if !valid_group_snapshot(&update, admission) {
             return GroupStateApply::InvalidSnapshot;
         }
@@ -1173,7 +1183,9 @@ mod tests {
     }
 
     /// The ack's relaxation is bounded to the one snapshot it is: once a call holds a roster, a
-    /// partial one is malformed again, whatever envelope it arrives under.
+    /// partial one is no longer an ack being admitted but a roster being claimed, so it is
+    /// refused through the ordinary path — and the ack path reports it as overtaken instead of
+    /// letting its missing integers decide anything.
     #[test]
     fn only_the_first_snapshot_may_be_the_partial_offer_ack() {
         let mut state = GroupCallState::new("CALL", creator());
@@ -1186,18 +1198,67 @@ mod tests {
         partial.connected_limit = 0;
         assert_eq!(
             state.apply_initial_offer_ack(partial.clone()),
-            GroupStateApply::InvalidSnapshot,
-            "a later roster cannot borrow the ack's missing integers"
+            GroupStateApply::Stale,
+            "a late partial ack is superseded by the roster already ordered"
         );
         assert_eq!(
             state.apply_update(partial),
             GroupStateApply::InvalidSnapshot,
-            "nor can it through the ordinary path"
+            "the ordinary path still refuses it as malformed"
         );
         assert_eq!(
             state.snapshot().map(|snapshot| snapshot.transaction_id),
             Some(5),
-            "the refused snapshots consumed no transaction"
+            "neither refusal consumed a transaction or replaced the roster"
+        );
+    }
+
+    /// A group update overtaking the ack is an outcome the offer path is written for, so the
+    /// overtaken ack must not fail it: it reports stale, and the roster — including a relay
+    /// allocation the newer update brought — stays exactly as the service ordered it.
+    #[test]
+    fn a_partial_ack_overtaken_by_an_ordered_roster_is_stale_and_changes_nothing() {
+        let mut state = GroupCallState::new("CALL", creator());
+        let mut ordered = update(
+            3,
+            vec![
+                participant("100001", "connected", 1),
+                participant("200002", "connected", 2),
+            ],
+        );
+        ordered.relay = Some(relay_tx(11));
+        assert_eq!(state.apply_update(ordered), GroupStateApply::Applied);
+
+        let mut late_ack = update(0, vec![participant("100001", "connected", 1)]);
+        late_ack.connected_limit = 0;
+        assert_eq!(
+            state.apply_initial_offer_ack(late_ack),
+            GroupStateApply::Stale,
+            "the offer path accepts stale, so the call continues on the roster it holds"
+        );
+        let held = state.snapshot().expect("the ordered roster is still held");
+        assert_eq!(
+            held.transaction_id, 3,
+            "the overtaken ack did not replace the roster"
+        );
+        assert_eq!(
+            held.participants.len(),
+            2,
+            "the overtaken ack did not shrink the roster"
+        );
+        assert_eq!(
+            held.relay.as_ref().and_then(|relay| relay.transaction_id),
+            Some(11),
+            "the newer relay allocation survived the overtaken ack"
+        );
+
+        // A foreign ack is still refused on identity, never reported as merely late.
+        let mut foreign = update(0, vec![]);
+        foreign.connected_limit = 0;
+        foreign.call_creator = Jid::new("999999", Server::Lid);
+        assert_eq!(
+            state.apply_initial_offer_ack(foreign),
+            GroupStateApply::IdentityMismatch
         );
     }
 

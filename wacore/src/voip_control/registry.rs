@@ -4323,8 +4323,8 @@ mod tests {
         );
         assert_eq!(
             reg.apply_initial_offer_ack_if_current(partial, generation),
-            GroupStateApply::InvalidSnapshot,
-            "the call already holds a snapshot, so a partial one is malformed again"
+            GroupStateApply::Stale,
+            "the call already holds an ordered roster, so the partial ack is reported overtaken"
         );
         assert_eq!(
             reg.apply_group_update_if_current(group_update(1), generation),

@@ -753,7 +753,11 @@ impl GroupMediaRegistry {
         if update.call_id != self.call_id || update.call_creator != self.call_creator {
             return Err(GroupMediaError::IdentityMismatch);
         }
-        if update.transaction_id == 0
+        // Transaction zero is the offer ack's partial roster: no roster transaction has been
+        // ordered, and media startup is where the registry holds no roster either — the same
+        // boundary the control plane draws when it admits that ack. Once a roster exists, a
+        // zero-transaction one is malformed again rather than eligible to replace it.
+        if (update.transaction_id == 0 && self.roster_transaction.is_some())
             || update.participants.len() > GROUP_CALL_MAX_PARTICIPANTS
             || !matches!(update.media.as_str(), "audio" | "video")
         {
@@ -1093,6 +1097,36 @@ mod tests {
                 "{route} route collision must preserve the active roster"
             );
         }
+    }
+
+    /// The offer ack's partial roster carries transaction zero, and media startup is where the
+    /// registry holds no roster yet: it is admitted exactly there, and refused as malformed the
+    /// moment a roster exists — the media side of the boundary the control plane draws for that
+    /// same ack, so an accepted offer cannot die configuring its own roster.
+    #[test]
+    fn a_transaction_zero_roster_is_admitted_only_as_the_first() {
+        let mut registry = registry();
+        let partial = update(0, vec![device("100001", 1, 1)]);
+        assert_eq!(
+            registry.apply_group_update(&partial),
+            Ok(GroupRosterApply::Applied),
+            "the ack's partial roster is the registry's first roster"
+        );
+        assert_eq!(registry.roster_transaction(), Some(0));
+
+        assert_eq!(
+            registry.apply_group_update(&partial),
+            Err(GroupMediaError::InvalidSnapshot),
+            "a second transaction-zero roster is malformed now that one exists"
+        );
+        assert_eq!(registry.roster_transaction(), Some(0));
+
+        assert_eq!(
+            registry.apply_group_update(&update(1, vec![device("100001", 1, 1)])),
+            Ok(GroupRosterApply::Applied),
+            "the first ordered roster still advances it"
+        );
+        assert_eq!(registry.roster_transaction(), Some(1));
     }
 
     #[test]
