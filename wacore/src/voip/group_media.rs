@@ -755,10 +755,13 @@ impl GroupMediaRegistry {
         }
         // Transaction zero is the offer ack's partial roster: no roster transaction has been
         // ordered, and media startup is where the registry holds no roster either — the same
-        // boundary the control plane draws when it admits that ack. Once a roster exists, a
-        // zero-transaction one is malformed again rather than eligible to replace it.
-        if (update.transaction_id == 0 && self.roster_transaction.is_some())
-            || update.participants.len() > GROUP_CALL_MAX_PARTICIPANTS
+        // boundary the control plane draws when it admits that ack. A replay of that same roster
+        // (media startup configures the engine with it, then queues the committed snapshot once
+        // more) must not be refused here: the stale check below reports it `Stale` without
+        // touching state, since zero cannot exceed any roster transaction and can therefore
+        // never replace one. Refusing it instead would publish a rejection for a roster this
+        // registry already accepted.
+        if update.participants.len() > GROUP_CALL_MAX_PARTICIPANTS
             || !matches!(update.media.as_str(), "audio" | "video")
         {
             return Err(GroupMediaError::InvalidSnapshot);
@@ -1100,9 +1103,9 @@ mod tests {
     }
 
     /// The offer ack's partial roster carries transaction zero, and media startup is where the
-    /// registry holds no roster yet: it is admitted exactly there, and refused as malformed the
-    /// moment a roster exists — the media side of the boundary the control plane draws for that
-    /// same ack, so an accepted offer cannot die configuring its own roster.
+    /// registry holds no roster yet: it is admitted exactly there. Startup then queues that same
+    /// committed roster once more, which must be ignored as a replay — stale, not a rejection of
+    /// a roster this registry already accepted — and zero must never displace an ordered roster.
     #[test]
     fn a_transaction_zero_roster_is_admitted_only_as_the_first() {
         let mut registry = registry();
@@ -1116,8 +1119,8 @@ mod tests {
 
         assert_eq!(
             registry.apply_group_update(&partial),
-            Err(GroupMediaError::InvalidSnapshot),
-            "a second transaction-zero roster is malformed now that one exists"
+            Ok(GroupRosterApply::Stale),
+            "the startup replay of the accepted roster is stale, not a rejection event"
         );
         assert_eq!(registry.roster_transaction(), Some(0));
 
@@ -1125,6 +1128,13 @@ mod tests {
             registry.apply_group_update(&update(1, vec![device("100001", 1, 1)])),
             Ok(GroupRosterApply::Applied),
             "the first ordered roster still advances it"
+        );
+        assert_eq!(registry.roster_transaction(), Some(1));
+
+        assert_eq!(
+            registry.apply_group_update(&partial),
+            Ok(GroupRosterApply::Stale),
+            "a zero-transaction roster can never replace an ordered one"
         );
         assert_eq!(registry.roster_transaction(), Some(1));
     }

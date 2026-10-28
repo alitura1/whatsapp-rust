@@ -1498,6 +1498,12 @@ fn group_offer_epoch_update<'a>(
     retained_epoch: Option<u32>,
 ) -> Option<&'a GroupCallUpdate> {
     (ack_update.rekey_requested
+        // A transaction-zero roster is the ack's partial one: no roster transaction has been
+        // ordered, so there is no valid key transaction to fan out under — `build_group_enc_rekey`
+        // refuses zero and an accepted ack would abort its own call setup. The request is kept,
+        // not answered with an invalid stanza: the first ordered roster that carries its own
+        // `rekey` answers it on the update path, where the transaction exists.
+        && current_update.transaction_id != 0
         && retained_epoch.is_none_or(|transaction| transaction < ack_update.transaction_id))
     .then_some(current_update)
 }
@@ -6037,6 +6043,47 @@ mod tests {
         assert!(group_offer_epoch_update(&ack, &current, Some(4)).is_some());
         assert!(group_offer_epoch_update(&ack, &current, Some(5)).is_none());
         assert!(group_offer_epoch_update(&ack, &current, Some(6)).is_none());
+    }
+
+    /// An accepted ack may arrive with neither update-plane integer and still request a rekey.
+    /// Its roster holds transaction zero — no roster transaction has been ordered — and a key
+    /// fan-out is built for one transaction id, so the request waits instead of aborting the
+    /// offer on a stanza `build_group_enc_rekey` would refuse to build.
+    #[test]
+    fn a_transaction_zero_offer_ack_defers_its_rekey_request() {
+        let partial = |transaction_id: u32| {
+            GroupCallUpdate::builder()
+                .call_id("GROUP-CALL".to_string())
+                .call_creator(Jid::new("111111111111111", Server::Lid))
+                .transaction_id(transaction_id)
+                .media("audio".to_string())
+                .connected_limit(0)
+                .joinable(true)
+                .av_upgradable(true)
+                .rekey_requested(true)
+                .participants(Vec::new())
+                .build()
+        };
+        let ack = partial(0);
+
+        assert!(
+            group_offer_epoch_update(&ack, &ack, None).is_none(),
+            "the partial roster carries no valid key transaction to fan out under"
+        );
+
+        let mut ordered = partial(1);
+        ordered.rekey_requested = false;
+        assert_eq!(
+            group_offer_epoch_update(&ack, &ordered, None).map(|update| update.transaction_id),
+            Some(1),
+            "an ordered roster overtaking the ack answers its request at its own transaction"
+        );
+
+        let fulfilled = partial(1);
+        assert!(
+            group_offer_epoch_update(&fulfilled, &ordered, Some(1)).is_none(),
+            "a retained equal epoch still stands in for a new fan-out"
+        );
     }
 
     #[test]

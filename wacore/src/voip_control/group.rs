@@ -89,6 +89,24 @@ impl GroupCallState {
         if !self.matches_identity(&update.call_id, &update.call_creator) {
             return GroupStateApply::IdentityMismatch;
         }
+        // Identity includes the group the roster belongs to, so a stated `group_jid` is
+        // reconciled — and a conflict refused — before any admission decision. Checked here,
+        // an overtaken partial ack with another group's identity reports `Stale` for a roster
+        // it was never part of, and the offer path accepts `Stale` while keeping the held
+        // snapshot beside that ack's relay.
+        if let Some(current_group_jid) = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.group_jid.as_ref())
+        {
+            match update.group_jid.as_ref() {
+                Some(group_jid) if group_jid != current_group_jid => {
+                    return GroupStateApply::IdentityMismatch;
+                }
+                None => update.group_jid = Some(current_group_jid.clone()),
+                Some(_) => {}
+            }
+        }
         let admission = match admission {
             // Only a state that holds no snapshot yet can be admitting the ack's partial one.
             SnapshotAdmission::InitialOfferAck if self.snapshot.is_none() => {
@@ -108,19 +126,6 @@ impl GroupCallState {
         };
         if !valid_group_snapshot(&update, admission) {
             return GroupStateApply::InvalidSnapshot;
-        }
-        if let Some(current_group_jid) = self
-            .snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.group_jid.as_ref())
-        {
-            match update.group_jid.as_ref() {
-                Some(group_jid) if group_jid != current_group_jid => {
-                    return GroupStateApply::IdentityMismatch;
-                }
-                None => update.group_jid = Some(current_group_jid.clone()),
-                Some(_) => {}
-            }
         }
 
         let advances_relay = update.relay.as_ref().is_some_and(|incoming| {
@@ -1227,6 +1232,7 @@ mod tests {
             ],
         );
         ordered.relay = Some(relay_tx(11));
+        ordered.group_jid = Some(Jid::new("100001-200002", Server::Group));
         assert_eq!(state.apply_update(ordered), GroupStateApply::Applied);
 
         let mut late_ack = update(0, vec![participant("100001", "connected", 1)]);
@@ -1259,6 +1265,32 @@ mod tests {
         assert_eq!(
             state.apply_initial_offer_ack(foreign),
             GroupStateApply::IdentityMismatch
+        );
+
+        // …and so is one that names a different group: the late report must not outrank the
+        // identity the roster already holds, because the offer path accepts `Stale` and would
+        // keep its held snapshot beside another group's ack.
+        let mut foreign_group = update(0, vec![participant("100001", "connected", 1)]);
+        foreign_group.connected_limit = 0;
+        foreign_group.group_jid = Some(Jid::new("5555555555-6666666666", Server::Group));
+        assert_eq!(
+            state.apply_initial_offer_ack(foreign_group),
+            GroupStateApply::IdentityMismatch
+        );
+
+        // An ack that states no group, or the held group itself, is still just late.
+        let mut same_group = update(0, vec![participant("100001", "connected", 1)]);
+        same_group.connected_limit = 0;
+        same_group.group_jid = Some(Jid::new("100001-200002", Server::Group));
+        assert_eq!(
+            state.apply_initial_offer_ack(same_group),
+            GroupStateApply::Stale
+        );
+        let mut no_group = update(0, vec![participant("100001", "connected", 1)]);
+        no_group.connected_limit = 0;
+        assert_eq!(
+            state.apply_initial_offer_ack(no_group),
+            GroupStateApply::Stale
         );
     }
 
