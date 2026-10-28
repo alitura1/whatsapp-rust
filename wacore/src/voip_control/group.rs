@@ -34,6 +34,10 @@ pub struct GroupCallState {
     waiting_room_transaction: Option<u32>,
     raised_hands: HashSet<Jid>,
     screen_shares: HashMap<Jid, ScreenShare>,
+    /// A rekey the initial ack asked for and transaction zero could not carry: the request is
+    /// parked when that ack is admitted and answered by the first ordered roster. It is the
+    /// outstanding request, never wire state — nothing about it is serialized onto a snapshot.
+    owed_rekey: bool,
 }
 
 impl GroupCallState {
@@ -46,6 +50,7 @@ impl GroupCallState {
             waiting_room_transaction: None,
             raised_hands: HashSet::new(),
             screen_shares: HashMap::new(),
+            owed_rekey: false,
         }
     }
 
@@ -228,8 +233,26 @@ impl GroupCallState {
                 })
                 .collect();
         }
+        let owed_rekey = matches!(admission, SnapshotAdmission::InitialOfferAck)
+            && update.rekey_requested
+            && update.transaction_id == 0;
         self.snapshot = Some(update);
+        // Set-only: the first ordered roster commits through this same function afterwards,
+        // and that commit is the answer the request waits for — it must never clear it before
+        // the caller takes it.
+        if owed_rekey {
+            self.owed_rekey = true;
+        }
         GroupStateApply::Applied
+    }
+
+    /// Take the rekey request the initial ack left outstanding for this call, if any.
+    ///
+    /// A transaction-zero ack cannot name a fan-out transaction (`build_group_enc_rekey`
+    /// refuses zero), so its request is parked at admission and answered by the first ordered
+    /// roster that arrives — whether or not that update repeats the flag. Consumed exactly once.
+    pub fn take_owed_rekey(&mut self) -> bool {
+        std::mem::take(&mut self.owed_rekey)
     }
 
     /// Replace waiting-room state when its optional transaction is not stale.
@@ -1337,6 +1360,67 @@ mod tests {
             GroupStateApply::IdentityMismatch
         );
         assert!(state.snapshot().is_none(), "nothing partial was committed");
+    }
+
+    /// A rekey the ack asks for rides nowhere on the wire — transaction zero cannot name a
+    /// fan-out transaction — so it is parked when the ack is admitted and taken exactly once:
+    /// a rejected ack parks nothing, a quiet ack parks nothing, and committing the answering
+    /// roster (which goes through this very function again) does not clear its own request.
+    #[test]
+    fn an_admitted_partial_ack_parks_its_rekey_request() {
+        let requesting_ack = || {
+            let mut ack = update(0, vec![participant("100001", "connected", 1)]);
+            ack.connected_limit = 0;
+            ack.rekey_requested = true;
+            ack
+        };
+
+        let mut state = GroupCallState::new("CALL", creator());
+        assert_eq!(
+            state.apply_initial_offer_ack(requesting_ack()),
+            GroupStateApply::Applied
+        );
+        assert!(
+            state.take_owed_rekey(),
+            "the admitted ack's request is parked and available"
+        );
+        assert!(!state.take_owed_rekey(), "and taken exactly once");
+
+        let mut state = GroupCallState::new("CALL", creator());
+        let mut rejected = requesting_ack();
+        rejected.media = "text".to_string();
+        assert_eq!(
+            state.apply_initial_offer_ack(rejected),
+            GroupStateApply::InvalidSnapshot
+        );
+        assert!(
+            !state.take_owed_rekey(),
+            "an unadmitted ack cannot owe a key"
+        );
+
+        let mut state = GroupCallState::new("CALL", creator());
+        let mut quiet = update(0, vec![]);
+        quiet.connected_limit = 0;
+        assert_eq!(
+            state.apply_initial_offer_ack(quiet),
+            GroupStateApply::Applied
+        );
+        assert!(!state.take_owed_rekey(), "nothing was requested");
+
+        let mut state = GroupCallState::new("CALL", creator());
+        assert_eq!(
+            state.apply_initial_offer_ack(requesting_ack()),
+            GroupStateApply::Applied
+        );
+        assert_eq!(
+            state.apply_update(update(1, vec![participant("100001", "connected", 1)])),
+            GroupStateApply::Applied,
+            "the first ordered roster commits"
+        );
+        assert!(
+            state.take_owed_rekey(),
+            "committing the answering roster leaves its own request for the caller to take"
+        );
     }
 
     /// A roster entry's own error code is not call state and is never folded into it: it is

@@ -1478,29 +1478,46 @@ async fn apply_group_control(client: &Client, call: &IncomingCall, generation: u
                     }
                     // A late relay is not a new roster epoch. Only a fresh committed roster may
                     // fan out a key, with inherited PIDs included and its original transaction.
-                    if update.rekey_requested
-                        && let Some(roster) = roster
-                    {
-                        match crate::voip::facade::fanout_group_epoch(client, &roster).await {
-                            Ok(fanout) => {
-                                let fanout_generation = fanout.generation();
-                                if let Err(error) = fanout.commit(|epoch| {
-                                    fanout_generation
-                                        .is_some_and(|generation| {
-                                            client.call_registry().send_group_epoch_if_current(
-                                                &update.call_id,
-                                                generation,
-                                                update.transaction_id,
-                                                epoch.to_vec(),
-                                            )
-                                        })
-                                        .then_some(())
-                                        .ok_or(CallError::Media(
-                                            "local group epoch consumer closed",
-                                        ))
-                                }) {
+                    if let Some(roster) = roster {
+                        // A transaction-zero ack could not name a fan-out transaction, so its
+                        // request was parked at admission; this first fresh roster answers it —
+                        // taken here whether or not the update itself repeats the flag, and never
+                        // for a roster that did not advance.
+                        let owed_rekey = registry
+                            .take_group_rekey_request_if_current(&update.call_id, generation);
+                        if update.rekey_requested || owed_rekey {
+                            match crate::voip::facade::fanout_group_epoch(client, &roster).await {
+                                Ok(fanout) => {
+                                    let fanout_generation = fanout.generation();
+                                    if let Err(error) = fanout.commit(|epoch| {
+                                        fanout_generation
+                                            .is_some_and(|generation| {
+                                                client.call_registry().send_group_epoch_if_current(
+                                                    &update.call_id,
+                                                    generation,
+                                                    update.transaction_id,
+                                                    epoch.to_vec(),
+                                                )
+                                            })
+                                            .then_some(())
+                                            .ok_or(CallError::Media(
+                                                "local group epoch consumer closed",
+                                            ))
+                                    }) {
+                                        warn!(
+                                            "call: failed to commit requested group epoch for {}: {error}",
+                                            update.call_id
+                                        );
+                                        client.call_registry().send_call_event_if_current(
+                                            &update.call_id,
+                                            generation,
+                                            CallEvent::GroupRekeyFailed,
+                                        );
+                                    }
+                                }
+                                Err(error) => {
                                     warn!(
-                                        "call: failed to commit requested group epoch for {}: {error}",
+                                        "call: failed to distribute requested group epoch for {}: {error}",
                                         update.call_id
                                     );
                                     client.call_registry().send_call_event_if_current(
@@ -1509,17 +1526,6 @@ async fn apply_group_control(client: &Client, call: &IncomingCall, generation: u
                                         CallEvent::GroupRekeyFailed,
                                     );
                                 }
-                            }
-                            Err(error) => {
-                                warn!(
-                                    "call: failed to distribute requested group epoch for {}: {error}",
-                                    update.call_id
-                                );
-                                client.call_registry().send_call_event_if_current(
-                                    &update.call_id,
-                                    generation,
-                                    CallEvent::GroupRekeyFailed,
-                                );
                             }
                         }
                     }
@@ -3388,6 +3394,93 @@ mod tests {
             registry.pending_group_epoch_transaction_if_current(call_id, generation),
             Some(2),
             "the requested epoch must still commit after the early transport receipt"
+        );
+        registry.remove_if_current(call_id, generation);
+    }
+
+    /// The initial ack may ask for a key that transaction zero cannot carry: setup skips the
+    /// fan-out, the admission parks the request, and the first fresh ordered roster answers it
+    /// — even though that update's own `rekey` flag is false, which is exactly the sequence the
+    /// offer path produces.
+    #[cfg(feature = "voip-control")]
+    #[tokio::test]
+    async fn transaction_zero_ack_rekey_is_answered_by_the_first_fresh_roster() {
+        use wacore::types::group_call::GroupCallUpdate;
+        use wacore::voip_control::CallSession;
+        use wacore::voip_control::group::GroupStateApply;
+
+        let client = make_sending_client().await;
+        client.set_connected_for_test(true);
+        let creator = fake_caller_lid();
+        client
+            .persistence_manager()
+            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+                creator.clone(),
+            )))
+            .await;
+        let call_id = "TX0-ACK-REKEY";
+        let registry = client.call_registry();
+        let generation = registry.insert(CallSession::new_outgoing(
+            call_id,
+            Jid::new(call_id, Server::Call),
+            creator.clone(),
+        ));
+
+        // The accepted ack names neither update-plane integer and asks for a key no transaction
+        // could carry: the offer setup cannot fan out, so the admission parks the request.
+        let ack = GroupCallUpdate::builder()
+            .call_id(call_id.to_string())
+            .call_creator(creator.clone())
+            .transaction_id(0)
+            .media("audio".to_string())
+            .connected_limit(0)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(true)
+            .participants(Vec::new())
+            .build();
+        assert_eq!(
+            registry.apply_initial_offer_ack_if_current(ack, generation),
+            GroupStateApply::Applied
+        );
+
+        // The first ordered roster does not repeat the request — it must answer it anyway.
+        let ordered = GroupCallUpdate::builder()
+            .call_id(call_id.to_string())
+            .call_creator(creator.clone())
+            .transaction_id(2)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(Vec::new())
+            .build();
+        let call = IncomingCall::new_for_test(
+            creator,
+            "TX0-ACK-REKEY-STANZA".into(),
+            wacore::time::from_secs(1_700_000_000).expect("time"),
+            CallAction::GroupUpdate {
+                update: Box::new(ordered),
+            },
+        );
+        assert!(apply_group_control(&client, &call, generation).await);
+
+        assert_eq!(
+            registry
+                .group_state_if_current(call_id, generation)
+                .and_then(|state| state.snapshot().map(|snapshot| snapshot.transaction_id)),
+            Some(2),
+            "the ordered roster committed normally"
+        );
+        assert_eq!(
+            registry.pending_group_epoch_transaction_if_current(call_id, generation),
+            Some(2),
+            "this roster answered the ack's outstanding request although its own flag is false"
+        );
+        assert!(
+            !registry.take_group_rekey_request_if_current(call_id, generation),
+            "the request was consumed by the roster that answered it"
         );
         registry.remove_if_current(call_id, generation);
     }

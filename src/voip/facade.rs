@@ -1500,9 +1500,10 @@ fn group_offer_epoch_update<'a>(
     (ack_update.rekey_requested
         // A transaction-zero roster is the ack's partial one: no roster transaction has been
         // ordered, so there is no valid key transaction to fan out under — `build_group_enc_rekey`
-        // refuses zero and an accepted ack would abort its own call setup. The request is kept,
-        // not answered with an invalid stanza: the first ordered roster that carries its own
-        // `rekey` answers it on the update path, where the transaction exists.
+        // refuses zero and an accepted ack would abort its own call setup. The request is parked
+        // on the call at admission instead and taken from there by the first fresh ordered
+        // roster on the update path (`take_group_rekey_request_if_current`), whether or not that
+        // update repeats the flag.
         && current_update.transaction_id != 0
         && retained_epoch.is_none_or(|transaction| transaction < ack_update.transaction_id))
     .then_some(current_update)

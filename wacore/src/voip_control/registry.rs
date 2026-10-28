@@ -958,6 +958,26 @@ impl CallRegistry {
             .0
     }
 
+    /// Take the rekey request an initial `offer` ack left outstanding for this call generation.
+    ///
+    /// A transaction-zero ack cannot carry a fan-out, so its request is parked when the ack is
+    /// admitted and answered by the first fresh ordered roster on the update path. Consumed
+    /// exactly once, and only while `generation` still owns the call-id: a superseded or
+    /// removed generation hands nothing out.
+    pub fn take_group_rekey_request_if_current(&self, call_id: &str, generation: u64) -> bool {
+        let mut map = self.active_calls();
+        let Some(entry) = map
+            .get_mut(call_id)
+            .filter(|entry| entry.generation == generation)
+        else {
+            return false;
+        };
+        let Some(group) = entry.group.as_mut() else {
+            return false;
+        };
+        group.take_owed_rekey()
+    }
+
     /// Apply an update and return its exact committed roster only when the roster advances.
     ///
     /// Relay-only adoption still returns `Applied`, but is not a new roster/rekey transaction.
@@ -4331,6 +4351,48 @@ mod tests {
             GroupStateApply::Applied,
             "the first ordered roster still advances the call"
         );
+    }
+
+    /// The ack's rekey request outlives the setup that could not answer it: parked only when
+    /// the ack is actually admitted, held against this generation alone, and handed out once so
+    /// the update path can answer it with the first ordered roster's real transaction.
+    #[test]
+    fn an_admitted_ack_parks_its_rekey_request_until_the_update_path_takes_it() {
+        let reg = CallRegistry::new();
+        let generation = reg.insert_group(session("GROUP-CALL"));
+        let mut partial = group_update(0);
+        partial.connected_limit = 0;
+        partial.rekey_requested = true;
+
+        assert_eq!(
+            reg.apply_initial_offer_ack_if_current(partial.clone(), generation),
+            GroupStateApply::Applied
+        );
+        assert!(
+            !reg.take_group_rekey_request_if_current("GROUP-CALL", generation + 1),
+            "a superseded generation holds nothing to take"
+        );
+        assert!(
+            reg.take_group_rekey_request_if_current("GROUP-CALL", generation),
+            "the admitted ack's request is available to the update path"
+        );
+        assert!(
+            !reg.take_group_rekey_request_if_current("GROUP-CALL", generation),
+            "and is consumed exactly once"
+        );
+        assert!(!reg.take_group_rekey_request_if_current("OTHER-CALL", generation));
+        assert!(reg.remove_if_current("GROUP-CALL", generation));
+
+        // An ack that asked for nothing parks nothing.
+        let reg = CallRegistry::new();
+        let generation = reg.insert_group(session("GROUP-CALL"));
+        let mut quiet = group_update(0);
+        quiet.connected_limit = 0;
+        assert_eq!(
+            reg.apply_initial_offer_ack_if_current(quiet, generation),
+            GroupStateApply::Applied
+        );
+        assert!(!reg.take_group_rekey_request_if_current("GROUP-CALL", generation));
     }
 
     #[test]
